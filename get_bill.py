@@ -1,12 +1,18 @@
-"""Scrape one bill's details and full text from congress.gov.
+"""Fetch one bill's details and full text.
 
-congress.gov sits behind bot protection that rejects plain HTTP clients, so this
-script drives a headless Chrome through Selenium. Chrome must be installed;
-webdriver-manager downloads a matching chromedriver automatically.
+Two data sources produce the same set of fields:
+
+* Default: scrape congress.gov. The site sits behind bot protection that
+  rejects plain HTTP clients, so this mode drives a headless Chrome through
+  Selenium (Chrome must be installed; webdriver-manager fetches chromedriver).
+* --govinfo: read the Government Publishing Office's bulk XML (BILLSTATUS and
+  bill text) from govinfo.gov with plain HTTP requests. No browser, no API key.
 """
 import re
 import sys
 import time
+import xml.etree.ElementTree as ET
+from datetime import datetime
 
 from bs4 import BeautifulSoup
 from selenium import webdriver
@@ -14,7 +20,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
-from common import USER_AGENT, log, make_parser, ordinal, output
+from common import USER_AGENT, fetch, log, make_parser, ordinal, output, xml_text
 
 SITE = "https://www.congress.gov"
 PAGE_LOAD_WAIT = 8  # seconds; congress.gov renders much of the page client-side
@@ -27,6 +33,18 @@ BILL_TYPES = {
     "SRES": "senate-resolution",
     "SJRES": "senate-joint-resolution",
 }
+
+# How congress.gov displays each bill type, e.g. "H.R.5", "S.J.Res.25".
+DISPLAY_PREFIX = {
+    "HR": "H.R.", "HRES": "H.Res.", "HJRES": "H.J.Res.",
+    "S": "S.", "SRES": "S.Res.", "SJRES": "S.J.Res.",
+}
+
+GOVINFO_STATUS_URL = (
+    "https://www.govinfo.gov/bulkdata/BILLSTATUS/{congress}/{type}/"
+    "BILLSTATUS-{congress}{type}{number}.xml"
+)
+GOVINFO_TEXT_URL = "https://www.govinfo.gov/content/pkg/{package}/html/{package}.htm"
 
 # The all-info page's <h1> reads e.g.
 # "All Information (Except Text) for H.R.5 - Parents Bill of Rights Act
@@ -164,12 +182,14 @@ def plain_text_url(text_page):
 
 
 def bill_text(text_page):
-    container = text_page.find("pre", id="billTextContainer")
+    """Plain bill text: congress.gov wraps it in <pre id="billTextContainer">,
+    govinfo.gov in a bare <pre>."""
+    container = text_page.find("pre", id="billTextContainer") or text_page.find("pre")
     return container.text.strip() if container else None
 
 
 # --------------------------------------------------------------------------- #
-# Scraper
+# Source 1: congress.gov via headless Chrome
 # --------------------------------------------------------------------------- #
 
 def get_bill_detail(congress, legis_num, proxy=None):
@@ -192,16 +212,117 @@ def get_bill_detail(congress, legis_num, proxy=None):
     return detail
 
 
+# --------------------------------------------------------------------------- #
+# Source 2: govinfo.gov bulk XML (no browser)
+# --------------------------------------------------------------------------- #
+
+def get_bill_detail_govinfo(congress, legis_num, proxy=None):
+    """Same fields as get_bill_detail, built from GPO's BILLSTATUS XML."""
+    bill_type, number = split_bill_number(legis_num)
+    type_code = bill_type.lower()
+    status_xml = fetch(
+        GOVINFO_STATUS_URL.format(congress=congress, type=type_code, number=number), proxy
+    )
+    if status_xml is None:
+        log("GovInfo has no status file for this bill (it may not exist, or is not published yet).")
+        return None
+    bill = ET.fromstring(status_xml).find("bill")
+
+    detail = {"id": f"{congress}-{bill_type}{number}"}
+    detail.update(parse_bill_status(bill, bill_type, number))
+
+    detail["text"] = None
+    package = latest_text_package(bill)
+    if package:
+        text_html = fetch(GOVINFO_TEXT_URL.format(package=package), proxy)
+        if text_html:
+            detail["text"] = bill_text(BeautifulSoup(text_html, "html.parser"))
+    return detail
+
+
+def parse_bill_status(bill, bill_type, number):
+    """Title, sponsor, committees, titles and summary, formatted like congress.gov."""
+    titles = [(xml_text(item, "titleType") or "", xml_text(item, "title") or "")
+              for item in bill.findall("titles/item")]
+    committees = [
+        f"{xml_text(item, 'chamber')} - {xml_text(item, 'name')}"
+        for item in bill.findall("committees/item")
+    ]
+    official = [title for kind, title in titles if kind.startswith("Official Title as Introduced")]
+    short = [title for kind, title in titles if kind.startswith("Short Title")]
+    return {
+        "title": f"{DISPLAY_PREFIX[bill_type]}{number} - {xml_text(bill, 'title')}",
+        "sponsor": sponsor_line(bill),
+        "committees": " | ".join(committees) or None,
+        "official_title": official[0] if official else None,
+        "short_titles": list(dict.fromkeys(short)),
+        **govinfo_summary(bill),
+    }
+
+
+def sponsor_line(bill):
+    """'Rep. Letlow, Julia [R-LA-5] (Introduced 03/01/2023)', as congress.gov shows it."""
+    sponsor = bill.find("sponsors/item")
+    if sponsor is None:
+        return None
+    introduced = us_date(xml_text(bill, "introducedDate"))
+    name = xml_text(sponsor, "fullName")
+    return f"{name} (Introduced {introduced})" if introduced else name
+
+
+def govinfo_summary(bill):
+    """Most recent CRS summary as plain text, plus the version it describes."""
+    summaries = bill.findall("summaries/summary")
+    if not summaries:
+        return {"summary_version": None, "summary": None}
+    latest = max(summaries, key=lambda item: xml_text(item, "actionDate") or "")
+    # The summary body is HTML, stored under <text> or <cdata><text>.
+    body = xml_text(latest, "text") or xml_text(latest, "cdata/text") or ""
+    blocks = [block_text(tag) for tag in BeautifulSoup(body, "html.parser").find_all(recursive=False)]
+    return {
+        "summary_version": f"{xml_text(latest, 'actionDesc')} ({us_date(xml_text(latest, 'actionDate'))})",
+        "summary": "\n\n".join(block for block in blocks if block) or None,
+    }
+
+
+def latest_text_package(bill):
+    """GovInfo package id (e.g. 'BILLS-118hr5rfs') of the newest text version."""
+    versions = [item for item in bill.findall("textVersions/item") if xml_text(item, "date")]
+    if not versions:
+        return None
+    newest = max(versions, key=lambda item: xml_text(item, "date"))
+    url = xml_text(newest, "formats/item/url") or ""
+    match = re.search(r"/pkg/([^/]+)/", url)
+    return match.group(1) if match else None
+
+
+def us_date(iso_date):
+    """'2023-03-01' -> '03/01/2023'; None stays None."""
+    if not iso_date:
+        return None
+    return datetime.strptime(iso_date[:10], "%Y-%m-%d").strftime("%m/%d/%Y")
+
+
+# --------------------------------------------------------------------------- #
+# Command line
+# --------------------------------------------------------------------------- #
+
 def main():
-    parser = make_parser("Scrape bill details from congress.gov", session=False)
+    parser = make_parser("Fetch bill details from congress.gov (Chrome) or govinfo.gov (--govinfo)", session=False)
     parser.add_argument("-l", "--legis_num", required=True,
                         help="Legislation number, e.g. HR5, 'S 10' or HJRES25")
+    parser.add_argument("--govinfo", action="store_true",
+                        help="Read GovInfo bulk XML instead of scraping congress.gov "
+                             "with Chrome (no browser or US proxy needed)")
     args = parser.parse_args()
 
+    fetch_detail = get_bill_detail_govinfo if args.govinfo else get_bill_detail
     try:
-        detail = get_bill_detail(args.congress, args.legis_num, args.proxy)
+        detail = fetch_detail(args.congress, args.legis_num, args.proxy)
     except ValueError as error:
         parser.error(str(error))
+    if detail is None:
+        sys.exit(1)
     output(detail, args.csv)
     if detail["title"] is None:
         sys.exit(1)

@@ -34,9 +34,10 @@ source .venv/bin/activate        # Windows: .\.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-`get_bill.py` drives a headless Chrome through Selenium, so Google Chrome must
-be installed; `webdriver-manager` downloads a matching chromedriver on first run.
-The other scripts only need `requests` and `beautifulsoup4`.
+`get_bill.py` without `--govinfo` drives a headless Chrome through Selenium, so
+Google Chrome must be installed; `webdriver-manager` downloads a matching
+chromedriver on first run. With `--govinfo`, and for all other scripts, only
+`requests` and `beautifulsoup4` are used.
 
 ## Common options
 
@@ -54,9 +55,16 @@ All scripts accept these options (`-h` shows the full list):
 ### Bill details (`get_bill.py`)
 
 ```bash
-python get_bill.py -c 118 -l HR5
-python get_bill.py -c 118 -l "S 10" --csv
+python get_bill.py -c 118 -l HR5 --govinfo
+python get_bill.py -c 118 -l "S 10" --govinfo --csv
+python get_bill.py -c 118 -l HR5 -p http://proxy-host:port     # scrape congress.gov with Chrome
 ```
+
+`--govinfo` reads the Government Publishing Office's bulk XML on govinfo.gov
+instead of scraping congress.gov. It needs no browser, no API key and no US
+proxy, and is the recommended mode. Without it the script drives a headless
+Chrome against congress.gov, which blocks most non-US IPs. Both modes return
+the same fields; govinfo.gov publishes updates a few hours after congress.gov.
 
 `-l`, `--legis_num` is required and accepts forms such as `HR5`, `hr 5`,
 `HJRES25` or `S.J.Res. 25`. Supported types: HR, HRES, HJRES, S, SRES, SJRES.
