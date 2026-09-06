@@ -1,15 +1,4 @@
 beautifulsoup4==4.13.3
-certifi==2025.1.31
-Jinja2==3.1.5
-lxml==5.3.1
-lxml_html_clean==0.4.1
-parse==1.20.2
-PyYAML==6.0.2
 requests==2.32.3
 selenium==4.29.0
-urllib3==1.26.20
 webdriver-manager==4.0.2
-webencodings==0.5.1
-xmltodict==0.14.2
-requests_html
-pandas

@@ -1,116 +1,116 @@
 # CongressScraper
 
-CongressScraper is a Python project for scraping bill and vote data from United States Congress websites (congress.gov, house.gov, senate.gov).
+CongressScraper is a set of small Python command-line scripts for pulling bill
+and roll-call vote data from the United States Congress websites
+(congress.gov, clerk.house.gov, senate.gov).
 
-## Features
+Every script prints its result to **stdout as JSON** by default, or as **CSV**
+with `--csv`. Progress and error messages go to stderr, so output can be
+redirected straight into a file:
 
-This project includes the following scripts:
+```bash
+python get_svotes.py -c 119 -s 1 --csv > senate_votes_119_1.csv
+```
 
-*   `get_bill.py`: Scrapes detailed information for a specified bill from congress.gov, including sponsor, committees, official title, short titles, summary, and the full text of the bill.
-*   `get_house_votes.py`: Scrapes the list of votes from the House of Representatives (clerk.house.gov) and optionally fetches detailed information for a specific roll call vote (including how each member voted).
-*   `get_svotes.py`: Scrapes the list of Senate votes for a specified session from senate.gov.
-*   `get_svote_detail.py`: Scrapes detailed information for a specified Senate vote from senate.gov, including vote tallies and how each senator voted.
+## Scripts
+
+| Script | Source | What it returns |
+|---|---|---|
+| `get_bill.py` | congress.gov | One bill: title, sponsor, committees, official and short titles, latest summary, full text |
+| `get_house_votes.py` | clerk.house.gov | List of House roll-call votes for a session, or one vote with every member's position |
+| `get_svotes.py` | senate.gov | List of Senate roll-call votes for a session |
+| `get_svote_detail.py` | senate.gov | One Senate vote: tallies, document/amendment info, every senator's position |
+
+`common.py` holds the code shared by all scripts (HTTP fetching, proxy handling,
+XML helpers, argument parsing and JSON/CSV output). It is not run directly.
 
 ## Installation
 
-1.  **Clone the repository** (if you haven't already):
-    ```bash
-    git clone <your-repository-url>
-    cd CongressScraper
-    ```
+```bash
+git clone <your-repository-url>
+cd CongressScraper
+python -m venv .venv
+source .venv/bin/activate        # Windows: .\.venv\Scripts\activate
+pip install -r requirements.txt
+```
 
-2.  **Create and activate a virtual environment** (recommended):
-    ```bash
-    python -m venv .venv
-    # Windows
-    .\.venv\Scripts\activate
-    # macOS/Linux
-    source .venv/bin/activate
-    ```
+`get_bill.py` drives a headless Chrome through Selenium, so Google Chrome must
+be installed; `webdriver-manager` downloads a matching chromedriver on first run.
+The other scripts only need `requests` and `beautifulsoup4`.
 
-3.  **Install dependencies**:
-    ```bash
-    pip install -r requirements.txt
-    ```
-    Note: The `get_bill.py` script uses Selenium and `webdriver-manager` to drive a web browser (Chrome). `webdriver-manager` will automatically download and manage the required ChromeDriver.
+## Common options
+
+All scripts accept these options (`-h` shows the full list):
+
+| Option | Meaning |
+|---|---|
+| `-c`, `--congress` | Congress number (default: 119) |
+| `-s`, `--session` | Session number, 1 or 2 (default: 1). Not used by `get_bill.py`. |
+| `-p`, `--proxy` | HTTP(S) proxy URL such as `http://host:port`. senate.gov and congress.gov block many non-US IP addresses, so a US exit node is often required. `requests` also honours the `HTTPS_PROXY` environment variable. |
+| `--csv` | Print CSV instead of JSON |
 
 ## Usage
 
-All scripts support command-line arguments to specify the Congress number, session, and other relevant details. You can use the `-h` or `--help` argument to see the detailed options for each script.
+### Bill details (`get_bill.py`)
 
-### Get Bill Details (`get_bill.py`)
-
-```bash
-python get_bill.py -c <congress_number> -l <legislation_number>
-```
-
-*   `-c`, `--congress`: The Congress number (e.g., 118).
-*   `-l`, `--legis_num`: The legislation number (e.g., 'HR5' or 'S10'). **Required**.
-
-**Example:** Get details for bill HR5 from the 118th Congress
 ```bash
 python get_bill.py -c 118 -l HR5
+python get_bill.py -c 118 -l "S 10" --csv
 ```
 
-### Get House Votes (`get_house_votes.py`)
+`-l`, `--legis_num` is required and accepts forms such as `HR5`, `hr 5`,
+`HJRES25` or `S.J.Res. 25`. Supported types: HR, HRES, HJRES, S, SRES, SJRES.
 
-**Get vote list:**
-```bash
-python get_house_votes.py -c <congress_number> -s <session_number> [--limit <number>]
-```
-*   `-c`, `--congress`: The Congress number (default: 119).
-*   `-s`, `--session`: The session number (default: 1).
-*   `--limit`: The maximum number of votes to scrape (default: 50).
+Fields: `id`, `title`, `sponsor`, `committees`, `official_title`,
+`short_titles`, `summary_version` (the bill version the summary describes),
+`summary` (plain text, list items as `- ` lines) and `text` (full bill text).
+Fields the page does not provide are `null`. If congress.gov blocks the request
+the script prints a warning to stderr, outputs nulls and exits with status 1;
+in practice a US proxy (`-p`) is needed from outside the United States.
 
-**Example:** Get the 50 most recent votes for the 1st session of the 119th Congress
+### House votes (`get_house_votes.py`)
+
 ```bash
+# 50 most recent votes of the 1st session of the 119th Congress
 python get_house_votes.py -c 119 -s 1 --limit 50
+
+# Roll call 62 in full, one CSV row per member
+python get_house_votes.py -c 119 -s 1 --rollcall 62 --csv
 ```
 
-**Get specific vote details:**
-```bash
-python get_house_votes.py -c <congress_number> -s <session_number> --rollcall <rollcall_number>
-```
-*   `--rollcall`: The roll call number for which to fetch details.
+* `--limit`: maximum number of votes to list (default: 50). The site serves 10 per page.
+* `--rollcall`: fetch this roll call in full instead of listing votes.
 
-**Example:** Get details for roll call vote 62 from the 1st session of the 119th Congress
-```bash
-python get_house_votes.py -c 119 -s 1 --rollcall 62
-```
-
-### Get Senate Vote List (`get_svotes.py`)
+### Senate vote list (`get_svotes.py`)
 
 ```bash
-python get_svotes.py -c <congress_number> -s <session_number>
-```
-*   `-c`, `--congress`: The Congress number (default: 119).
-*   `-s`, `--session`: The session number (default: 1).
-
-**Example:** Get the Senate vote list for the 1st session of the 119th Congress
-```bash
-python get_svotes.py -c 119 -s 1
+python get_svotes.py -c 119 -s 1 -p http://proxy-host:port
 ```
 
-### Get Senate Vote Detail (`get_svote_detail.py`)
+Votes taken *en bloc* (several nominations in one roll call) carry an `en_bloc`
+list of the bundled matters instead of a single issue/question/result.
+
+### Senate vote detail (`get_svote_detail.py`)
 
 ```bash
-python get_svote_detail.py -c <congress_number> -s <session_number> -v <vote_number>
+python get_svote_detail.py -c 119 -s 1 -v 134 -p http://proxy-host:port --csv
 ```
-*   `-c`, `--congress`: The Congress number (default: 119).
-*   `-s`, `--session`: The session number (default: 1).
-*   `-v`, `--vote`: The vote number (default: 134).
 
-**Example:** Get details for Senate vote 134 from the 1st session of the 119th Congress
-```bash
-python get_svote_detail.py -c 119 -s 1 -v 134
-```
+* `-v`, `--vote`: the vote number (required).
+
+## CSV layout
+
+* Nested objects are flattened with `_` (for example `vote_counts_yea`).
+* Lists (such as `en_bloc` or `short_titles`) are stored as a JSON string in one cell.
+* Vote-detail scripts emit one row per member, prefixed with the vote's identifying columns.
 
 ## Notes
 
-*   Web scraping can break if the structure of the target websites changes.
-*   Please respect the `robots.txt` files and terms of service of the target websites.
-*   Making frequent requests might get your IP address blocked. It's recommended to add appropriate delays between requests (some scripts already include delays).
-*   `get_bill.py` depends on Selenium and Chrome/ChromeDriver. Ensure your environment is set up correctly.
+* Web scraping breaks when the target sites change their markup or feeds.
+* Respect the sites' `robots.txt` and terms of service, and keep request rates low.
+  The House list scraper pauses between pages.
+* `get_bill.py` waits a fixed 8 seconds per page for congress.gov to render.
 
 ## License
+
 Distributed under the MIT License.

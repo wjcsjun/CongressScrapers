@@ -1,202 +1,211 @@
-from bs4 import BeautifulSoup
+"""Scrape one bill's details and full text from congress.gov.
 
-from selenium import webdriver
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-import time
+congress.gov sits behind bot protection that rejects plain HTTP clients, so this
+script drives a headless Chrome through Selenium. Chrome must be installed;
+webdriver-manager downloads a matching chromedriver automatically.
+"""
 import re
-import pprint
-import argparse
+import sys
+import time
 
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
-def split_bill_number(bill_id):
-    """
-    Split the bill number into prefix and numeric parts.
-    
-    Args:
-        bill_id (str): The bill number, e.g., 'hr198', 'hrs1988', 'hjres25', etc.
-        
-    Returns:
-        list: A list containing two elements [prefix, number].
-    """
-    # Use regular expression to match the letter part and the number part
-    match = re.match(r'([a-zA-Z]+)(\d+)', bill_id.upper())
-    
-    if match:
-        prefix = match.group(1)  # Letter part
-        number = match.group(2)  # Number part
-        return [prefix, number]
-    else:
-        # If the format does not match, return the original string and an empty string
-        return [bill_id, '']
+from common import USER_AGENT, log, make_parser, ordinal, output
 
-bill_type_map: dict = {
-    'HR': 'house-bill',
-    'HRES': 'house-resolution',
-    'HJRES': 'house-joint-resolution',
-    'S': 'senate-bill',
-    'SRES': 'senate-resolution',
-    'SJRES': 'senate-joint-resolution'
+SITE = "https://www.congress.gov"
+PAGE_LOAD_WAIT = 8  # seconds; congress.gov renders much of the page client-side
+
+BILL_TYPES = {
+    "HR": "house-bill",
+    "HRES": "house-resolution",
+    "HJRES": "house-joint-resolution",
+    "S": "senate-bill",
+    "SRES": "senate-resolution",
+    "SJRES": "senate-joint-resolution",
 }
 
-def get_next_non_empty_sibling(tag):
-    next_sib = tag.next_sibling
-    while next_sib and not next_sib.text.strip():
-        #print(next_sib, "in line 117")
-        next_sib = next_sib.next_sibling
-    return next_sib
+# The all-info page's <h1> reads e.g.
+# "All Information (Except Text) for H.R.5 - Parents Bill of Rights Act
+#  118th Congress (2023-2024)"; keep just the bill number and name.
+TITLE_PREFIX = re.compile(r"^All Information \(Except Text\) for\s+")
+TITLE_SUFFIX = re.compile(r"\s+\d+(?:st|nd|rd|th) Congress \(\d{4}-\d{4}\)$")
 
-def get_bill_detail(congress: int, legis_num: str):
-    """
-    Get bill details.
-    """
-    base_url = 'https://www.congress.gov/bill'
-    legis_num = legis_num.upper()
-    bill_detail = {}
-    bill_detail['id'] = f'{congress}-{''.join(legis_num.split())}'
-    congress = f'{congress}th-congress'
-    if ' ' in legis_num:
-        legnumlist = legis_num.split()
-    else:
-        legnumlist = split_bill_number(legis_num)
-    
 
-    bill_num = legnumlist[-1]
-    bill_type = ''.join(legnumlist[:-1])
-    bill_type = bill_type_map.get(bill_type, 'unknown')
-    if bill_type == 'unknown':
-        raise ValueError(f"Unsupported bill type: {bill_type}")
-    
-    bill_url = f'{base_url}/{congress}/{bill_type}/{bill_num}/all-info'
-    texturl = f'{base_url}/{congress}/{bill_type}/{bill_num}/text'
-    print(bill_url)
-    print(texturl)
+def split_bill_number(legis_num):
+    """'HR5', 'hr 5' or 'H.J.Res. 25' -> ('HR', '5') / ('HJRES', '25')."""
+    compact = re.sub(r"[\s.]", "", legis_num).upper()
+    match = re.fullmatch(r"([A-Z]+)(\d+)", compact)
+    if not match or match.group(1) not in BILL_TYPES:
+        raise ValueError(f"Unsupported legislation number: {legis_num!r}")
+    return match.group(1), match.group(2)
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-    
+
+# --------------------------------------------------------------------------- #
+# Browser
+# --------------------------------------------------------------------------- #
+
+def make_driver(proxy=None):
     options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument(f"user-agent={headers['User-Agent']}")
+    for argument in ("--headless", "--no-sandbox", "--disable-dev-shm-usage",
+                     f"user-agent={USER_AGENT}"):
+        options.add_argument(argument)
+    if proxy:
+        options.add_argument(f"--proxy-server={proxy}")
+    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
 
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
-    
-    driver.get(bill_url)
-    time.sleep(8)  # Wait for the page to load
 
-    html = driver.page_source
-    
-    soup = BeautifulSoup(html, 'html.parser')
+def load_page(driver, url):
+    """Open url, wait for client-side rendering, and return the parsed page."""
+    log(f"Loading {url}")
+    driver.get(url)
+    time.sleep(PAGE_LOAD_WAIT)
+    return BeautifulSoup(driver.page_source, "html.parser")
 
-    
-            
-    # Extract Bill Title
-    title_element = soup.find('h1', class_='legDetail')
-    if title_element:
-        bill_detail['title'] = title_element.text.strip()
-    
 
-    overview_wrapper = soup.find('div', class_='overview_wrapper')
+# --------------------------------------------------------------------------- #
+# Page parsing
+# --------------------------------------------------------------------------- #
 
-    # Extract Sponsor
-    sponsor_element = overview_wrapper.find('th', attrs={'scope': 'row'}, string='Sponsor:')
-    
-    if sponsor_element:
-        sponsor = sponsor_element.find_next_sibling('td')
-        if sponsor:
-            bill_detail['sponsor'] = sponsor.text.strip()
-    
-    # Extract committees
-    committees_element = overview_wrapper.find('th', attrs={'scope': 'row'}, string='Committees:')
-    if committees_element:
-        committees = committees_element.find_next_sibling('td')
-        if committees:
-            bill_detail['committees'] = committees.text.strip()
-    
-    title_section = soup.find(string=re.compile('Official Title as Introduced'))
-    
-    if title_section:
-        #print(title_section.parent)
-        #print(title_section.parent.parent.find("p"))
-        official_title = title_section.parent.parent.find("p").text.strip()
-    
-    bill_detail['official_title'] = official_title
+def parse_bill_info(soup):
+    """Title, sponsor, committees, titles and summary from the all-info page."""
+    overview = soup.find("div", class_="overview_wrapper") or soup
+    return {
+        "title": bill_title(soup),
+        "sponsor": overview_field(overview, "Sponsor:"),
+        "committees": overview_field(overview, "Committees:"),
+        "official_title": official_title(soup),
+        "short_titles": short_titles(soup),
+        **latest_summary(soup),
+    }
 
-    #<div id="titles_main">
-    short_titles_section = soup.find('div', id='titles_main')
-    #print(short_titles_section)
-    if short_titles_section:
-        short_titles = [short_title.text.strip() for short_title in short_titles_section.find_all('p')]
-    
 
-    newshort_titles = []
-    for short in short_titles[:-1]:
-        newshort_titles.extend(short.splitlines())
-    
-    for sk in range(len(newshort_titles)):
-        newshort_titles[sk] = newshort_titles[sk].strip()
-    
-    newshort_titles = list(set(newshort_titles))
-    
-    
-    bill_detail['short_titles'] = newshort_titles
-    
+def bill_title(soup):
+    heading = soup.find("h1", class_="legDetail")
+    if not heading:
+        return None
+    text = " ".join(heading.text.split())
+    return TITLE_SUFFIX.sub("", TITLE_PREFIX.sub("", text))
 
-    bill_detail['summary'] = ''
 
-    latest_summary = soup.find('div', id='latestSummary-content')
-    #print(latest_summary)
-    if latest_summary:
-        current_summary = latest_summary.find(class_="currentVersion")
-        #print(current_summary)
-        if current_summary:
-            #print(get_next_non_empty_sibling(current_summary))
-            if get_next_non_empty_sibling(current_summary):
-                bill_detail['summary'] = get_next_non_empty_sibling(current_summary).text.strip()
-    
-    # Extract text
-    driver.get(texturl)
-    time.sleep(8)  # Wait for the page to load
-    text_html = driver.page_source
-    text_soup = BeautifulSoup(text_html, 'html.parser')
-    text_section = text_soup.find('div', class_='cdg-summary-wrapper', id='textSelector')
-    if text_section:
-        atags = text_section.find_all('a')
-        for atag in atags:
-            if 'format=txt' in atag.get('href'):
-                txturl = atag.get('href')
-                break
-    
-    print(txturl)
-    txturl = 'https://www.congress.gov'+txturl
-    
-    driver.get(txturl)
-    time.sleep(8)  # Wait for the page to load
-    text_html = driver.page_source
-    
-    bill_detail['text'] = ''
-    text_soup = BeautifulSoup(text_html, 'html.parser')
-    text_section = text_soup.find('pre', id='billTextContainer')  ##billTextContainer
-    if text_section:
-        bill_detail['text'] = text_section.text.strip()
+def overview_field(overview, label):
+    """Value cell of the overview-table row whose header is `label`."""
+    header = overview.find("th", attrs={"scope": "row"}, string=label)
+    cell = header.find_next_sibling("td") if header else None
+    return cell.text.strip() if cell else None
 
-    driver.quit()
-    return bill_detail
+
+def official_title(soup):
+    heading = soup.find(string=re.compile("Official Title as Introduced"))
+    paragraph = heading.parent.find_next("p") if heading else None
+    return " ".join(paragraph.text.split()) if paragraph else None
+
+
+def short_titles(soup):
+    """Distinct short titles in page order.
+
+    The titles section holds both "Short Titles" and "Official Titles"
+    sub-sections, each introduced by an <h3>; only paragraphs under the former
+    are short titles.
+    """
+    section = soup.find("div", id="titles_main")
+    if not section:
+        return []
+    titles = []
+    in_short_titles = False
+    for tag in section.find_all(["h3", "p"]):
+        if tag.name == "h3":
+            in_short_titles = tag.text.strip().startswith("Short Title")
+        elif in_short_titles:
+            titles.extend(line.strip() for line in tag.text.splitlines() if line.strip())
+    return list(dict.fromkeys(titles))
+
+
+def latest_summary(soup):
+    """The latest CRS summary as plain text, plus the bill version it describes.
+
+    The summary block is a heading (<h3 class="currentVersion">) followed by
+    sibling <p>/<ul> elements up to an <hr>.
+    """
+    container = soup.find("div", id="latestSummary-content")
+    heading = container.find(class_="currentVersion") if container else None
+    if heading is None:
+        return {"summary_version": None, "summary": None}
+
+    version = heading.find("span")
+    blocks = []
+    for sibling in heading.find_next_siblings():
+        if sibling.name == "hr":
+            break
+        blocks.append(block_text(sibling))
+    return {
+        "summary_version": " ".join(version.text.split()) if version else None,
+        "summary": "\n\n".join(block for block in blocks if block) or None,
+    }
+
+
+def block_text(tag):
+    """Whitespace-normalised text of a block; list items become '- item' lines."""
+    if tag.name in ("ul", "ol"):
+        return "\n".join("- " + " ".join(li.text.split()) for li in tag.find_all("li"))
+    return " ".join(tag.text.split())
+
+
+def plain_text_url(text_page):
+    """Link to the plain-text version of the bill, from the text-format selector."""
+    selector = text_page.find("div", class_="cdg-summary-wrapper", id="textSelector")
+    for link in selector.find_all("a") if selector else []:
+        if "format=txt" in (link.get("href") or ""):
+            return SITE + link["href"]
+    return None
+
+
+def bill_text(text_page):
+    container = text_page.find("pre", id="billTextContainer")
+    return container.text.strip() if container else None
+
+
+# --------------------------------------------------------------------------- #
+# Scraper
+# --------------------------------------------------------------------------- #
+
+def get_bill_detail(congress, legis_num, proxy=None):
+    bill_type, number = split_bill_number(legis_num)
+    bill_url = f"{SITE}/bill/{ordinal(congress)}-congress/{BILL_TYPES[bill_type]}/{number}"
+    detail = {"id": f"{congress}-{bill_type}{number}"}
+
+    driver = make_driver(proxy)
+    try:
+        info_page = load_page(driver, f"{bill_url}/all-info")
+        detail.update(parse_bill_info(info_page))
+        if detail["title"] is None:
+            page_title = info_page.title.text.strip() if info_page.title else "no <title>"
+            log(f"Warning: bill page did not render as expected (page title: {page_title!r}). "
+                "congress.gov may have blocked the request; try --proxy with a US exit node.")
+        text_url = plain_text_url(load_page(driver, f"{bill_url}/text"))
+        detail["text"] = bill_text(load_page(driver, text_url)) if text_url else None
+    finally:
+        driver.quit()
+    return detail
+
+
+def main():
+    parser = make_parser("Scrape bill details from congress.gov", session=False)
+    parser.add_argument("-l", "--legis_num", required=True,
+                        help="Legislation number, e.g. HR5, 'S 10' or HJRES25")
+    args = parser.parse_args()
+
+    try:
+        detail = get_bill_detail(args.congress, args.legis_num, args.proxy)
+    except ValueError as error:
+        parser.error(str(error))
+    output(detail, args.csv)
+    if detail["title"] is None:
+        sys.exit(1)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Scrape bill details')
-    parser.add_argument('-c', '--congress', type=int, default=119, help='Congress number')
-    parser.add_argument('-l', '--legis_num', type=str, help='Legislation number')
-    args = parser.parse_args()
-    detail = get_bill_detail(args.congress, args.legis_num)
-    pprint.pprint(detail)
-
-
-
-
-    
+    main()
